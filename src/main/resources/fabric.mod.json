@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "meteor-addon",
+  "name": "ComplexMC Bypasses Summer 2026",
+  "version": "1.0.0",
+  "description": "ComplexMC Bypasses & Anti-AFK Suite for Summer 2026.",
+  "authors": [
+    "Developer"
+  ],
+  "environment": "client",
+  "entrypoints": {
+    "meteor": [
+      "com.example.addon.AddonMain"
+    ]
+  },
+  "depends": {
+    "java": ">=21",
+    "minecraft": "*",
+    "fabricloader": "*"
+  }
+}
