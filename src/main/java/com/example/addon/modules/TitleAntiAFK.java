@@ -315,25 +315,25 @@ public class TitleAntiAFK extends Module {
     }
 
     private void initActionForText(String text) {
+        mc.options.keyShift.setDown(titleHasSneak);
+        mc.options.keyJump.setDown(titleHasJump);
+
         if (titleHasLookLeft) {
             startYaw = mc.player.getYRot();
-            targetYaw = startYaw - 180f;
+            targetYaw = originalYaw - 180f;
             targetPitch = originalPitch;
             stepTimeElapsed = 0f;
             stepDurationSeconds = 0.8f;
         } else if (titleHasLookRight) {
             startYaw = mc.player.getYRot();
-            targetYaw = startYaw + 180f;
+            targetYaw = originalYaw + 180f;
             targetPitch = originalPitch;
             stepTimeElapsed = 0f;
             stepDurationSeconds = 0.8f;
-        } else if (titleHasSneak) {
-            mc.options.keyShift.setDown(true);
-        } else if (titleHasJump) {
-            if (mc.player.onGround()) {
-                mc.player.jumpFromGround();
-            }
-            mc.options.keyJump.setDown(true);
+        }
+
+        if (titleHasJump && mc.player.onGround()) {
+            mc.player.jumpFromGround();
         }
     }
 
