@@ -197,30 +197,42 @@ public class TitleAntiAFK extends Module {
 
     public void processTitleText(String text) {
         if (text == null || text.isBlank()) return;
+        String normalized = text.toLowerCase(Locale.ROOT).trim();
 
         if (bruteForceTotalTicks > 0) {
-            info("Brute Force active: Ignored secondary title \"" + text + "\"");
+            info("Brute Force active: Ignored secondary title \"" + normalized + "\"");
+            return;
+        }
+
+        boolean hasSneak = normalized.contains("sneak");
+        boolean hasJump = normalized.contains("jump");
+        boolean hasLookLeft = normalized.contains("look left");
+        boolean hasLookRight = normalized.contains("look right");
+        boolean hasAction = hasSneak || hasJump || hasLookLeft || hasLookRight;
+        boolean triggerBruteForce = bruteForce.get() || onAnyTitle.get();
+
+        if (!triggerBruteForce && !hasAction) {
             return;
         }
 
         saveState();
-        activeTitleText = text;
+        activeTitleText = normalized;
         titleActiveTicks = titleHoldSeconds.get() * 20;
 
-        titleHasSneak = text.contains("sneak");
-        titleHasJump = text.contains("jump");
-        titleHasLookLeft = text.contains("look left");
-        titleHasLookRight = text.contains("look right");
+        titleHasSneak = hasSneak;
+        titleHasJump = hasJump;
+        titleHasLookLeft = hasLookLeft;
+        titleHasLookRight = hasLookRight;
 
-        if (bruteForce.get() || onAnyTitle.get()) {
+        if (triggerBruteForce) {
             bruteForceTotalTicks = bruteForceDuration.get() * 20;
             startBruteForceSequence();
-            info("Brute force Anti-AFK triggered for title: \"" + text + "\"");
+            info("Brute force Anti-AFK triggered for title: \"" + normalized + "\"");
             return;
         }
 
-        info("Title detected: \"" + text + "\" (Executing while active for " + titleHoldSeconds.get() + "s)");
-        initActionForText(text);
+        info("Title detected: \"" + normalized + "\" (Executing while active for " + titleHoldSeconds.get() + "s)");
+        initActionForText(normalized);
     }
 
     private void startBruteForceSequence() {
