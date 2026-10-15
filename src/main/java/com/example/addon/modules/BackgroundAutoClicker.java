@@ -2,6 +2,7 @@ package com.example.addon.modules;
 
 import com.example.addon.AddonMain;
 import meteordevelopment.meteorclient.events.world.TickEvent;
+import meteordevelopment.meteorclient.mixin.MinecraftAccessor;
 import meteordevelopment.meteorclient.mixininterface.IMinecraft;
 import meteordevelopment.meteorclient.settings.BoolSetting;
 import meteordevelopment.meteorclient.settings.IntSetting;
@@ -10,9 +11,6 @@ import meteordevelopment.meteorclient.settings.SettingGroup;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.utils.Utils;
 import meteordevelopment.orbit.EventHandler;
-import net.minecraft.world.InteractionHand;
-import net.minecraft.world.phys.EntityHitResult;
-import net.minecraft.world.phys.HitResult;
 
 public class BackgroundAutoClicker extends Module {
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
@@ -100,26 +98,16 @@ public class BackgroundAutoClicker extends Module {
     private void performRightClick() {
         if (mc.gameMode == null || mc.player == null) return;
 
-        // Trigger Meteor internal right-click flag
+        // Trigger Meteor internal right-click flag (executes startUseItem in onPreTick regardless of mc.screen)
         ((IMinecraft) mc).meteor$rightClick();
-
-        // Direct interaction for background/screen execution
-        if (mc.screen != null) {
-            mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND);
-        }
     }
 
     private void performLeftClick() {
         if (mc.gameMode == null || mc.player == null) return;
 
-        // Trigger left-click swing
+        // Clear any pending miss cooldown (including 10-tick air miss or 10000-tick screen lock) before attacking
+        ((MinecraftAccessor) mc).meteor$setMissTime(0);
         Utils.leftClick();
-
-        // If screen is open, execute direct attack if aiming at an entity
-        if (mc.screen != null && mc.hitResult != null && mc.hitResult.getType() == HitResult.Type.ENTITY) {
-            EntityHitResult entityHit = (EntityHitResult) mc.hitResult;
-            mc.gameMode.attack(mc.player, entityHit.getEntity());
-            mc.player.swing(InteractionHand.MAIN_HAND);
-        }
     }
 }
+

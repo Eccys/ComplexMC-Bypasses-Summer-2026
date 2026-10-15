@@ -62,8 +62,10 @@ public class TitleDemoer extends Module {
             Component component = Component.literal(displayStr);
 
             // Configure title animation times (10 ticks fade in, duration*20 stay, 10 ticks fade out)
-            mc.gui.setTimes(10, titleDurationSeconds.get() * 20, 10);
-            mc.gui.setTitle(component);
+            if (mc.gui != null) {
+                mc.gui.setTimes(10, titleDurationSeconds.get() * 20, 10);
+                mc.gui.setTitle(component);
+            }
 
             // Direct trigger to TitleAntiAFK module if active
             TitleAntiAFK antiAfk = Modules.get().get(TitleAntiAFK.class);
