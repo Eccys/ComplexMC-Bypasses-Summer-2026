@@ -31,11 +31,11 @@ public class HoldAutoLog extends Module {
     private void onTick(TickEvent.Pre event) {
         if (!Utils.canUpdate()) return;
 
-        Item heldMain = mc.player.getMainHandItem().getItem();
-        Item heldOff = mc.player.getOffhandItem().getItem();
+        Item heldMain = mc.player.getMainHandItem().isEmpty() ? null : mc.player.getMainHandItem().getItem();
+        Item heldOff = mc.player.getOffhandItem().isEmpty() ? null : mc.player.getOffhandItem().getItem();
         Item trigger = targetItem.get();
 
-        if (heldMain == trigger || heldOff == trigger) {
+        if (shouldAutoLog(heldMain, heldOff, trigger)) {
             String itemName = trigger.getName(trigger.getDefaultInstance()).getString();
             info("Holding target item (" + itemName + "). Logging out and toggling off module.");
 
@@ -47,6 +47,11 @@ public class HoldAutoLog extends Module {
                 toggle();
             }
         }
+    }
+
+    public static boolean shouldAutoLog(Item heldMain, Item heldOff, Item trigger) {
+        if (trigger == null) return false;
+        return (heldMain != null && heldMain == trigger) || (heldOff != null && heldOff == trigger);
     }
 
     private void disconnect(String reason) {

@@ -22,7 +22,14 @@ repositories {
 dependencies {
     minecraft(libs.minecraft)
     implementation(libs.fabric.loader)
-    implementation(project(":"))
+    if (project.path == ":") {
+        implementation("meteordevelopment:meteor-client:${libs.versions.minecraft.get()}-SNAPSHOT")
+    } else {
+        implementation(project(":"))
+    }
+    testImplementation(platform("org.junit:junit-bom:5.11.4"))
+    testImplementation("org.junit.jupiter:junit-jupiter")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
 java {
@@ -33,4 +40,8 @@ java {
 
 tasks.withType<JavaCompile> {
     options.encoding = "UTF-8"
+}
+
+tasks.withType<Test> {
+    useJUnitPlatform()
 }

@@ -22,9 +22,11 @@ import net.minecraft.world.phys.Vec3;
 
 import java.util.Locale;
 import java.util.Random;
+import java.util.regex.Pattern;
 
 public class TitleAntiAFK extends Module {
     private static final float PI_FLOAT = (float) Math.PI;
+    private static final Pattern FORMATTING_CODE_PATTERN = Pattern.compile("(?i)\u00A7[0-9A-FK-ORX]");
 
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
     private final SettingGroup sgBruteForce = settings.createGroup("Brute Force");
@@ -79,44 +81,402 @@ public class TitleAntiAFK extends Module {
         .build()
     );
 
-    // Position & Rotation Memory
-    private Vec3 originalPos;
-    private float originalYaw;
-    private float originalPitch;
-    private boolean savedState = false;
-
-    // Active title tracking & cached action flags
-    private String activeTitleText = null;
-    private int titleActiveTicks = 0;
-    private boolean titleHasSneak = false;
-    private boolean titleHasJump = false;
-    private boolean titleHasLookLeft = false;
-    private boolean titleHasLookRight = false;
-
     // Sequential Camera Rotation Steps — each step is at most 180° so no degree wrapping needed
-    private enum LookStep {
+    public enum LookStep {
         LOOK_LEFT,          // originalYaw -> originalYaw - 180  (left 180°)
         CENTER_FROM_LEFT,   // originalYaw - 180 -> originalYaw  (right 180° back to center)
         LOOK_RIGHT,         // originalYaw -> originalYaw + 180  (right 180°)
         CENTER_FROM_RIGHT,  // originalYaw + 180 -> originalYaw  (left 180° back to center)
         LOOK_UP,            // originalPitch -> -75               (pitch up)
         LOOK_DOWN,          // -75 -> +75                         (pitch down 150°)
-        RESET_PITCH         // +75 -> originalPitch               (pitch back to origin)
+        RESET_PITCH;        // +75 -> originalPitch               (pitch back to origin)
+
+        public boolean isHorizontal() {
+            return this == LOOK_LEFT || this == CENTER_FROM_LEFT || this == LOOK_RIGHT || this == CENTER_FROM_RIGHT;
+        }
+
+        public LookStep next() {
+            return switch (this) {
+                case LOOK_LEFT -> CENTER_FROM_LEFT;
+                case CENTER_FROM_LEFT -> LOOK_RIGHT;
+                case LOOK_RIGHT -> CENTER_FROM_RIGHT;
+                case CENTER_FROM_RIGHT -> LOOK_UP;
+                case LOOK_UP -> LOOK_DOWN;
+                case LOOK_DOWN -> RESET_PITCH;
+                case RESET_PITCH -> LOOK_LEFT;
+            };
+        }
     }
 
-    private int bruteForceTotalTicks = 0;
-    private LookStep currentLookStep = LookStep.LOOK_LEFT;
+    public record TitleActions(
+        boolean sneak,
+        boolean jump,
+        boolean lookLeft,
+        boolean lookRight,
+        boolean lookUp,
+        boolean lookDown
+    ) {
+        public boolean hasAnyAction() {
+            return sneak || jump || lookLeft || lookRight || lookUp || lookDown;
+        }
 
-    // High-FPS frame-rate interpolation variables
-    private float stepTimeElapsed = 0f;
-    private float stepDurationSeconds = 1.2f;
-    private int sneakPulseTicks = 0;
+        public boolean hasLookAction() {
+            return lookLeft || lookRight || lookUp || lookDown;
+        }
+    }
 
-    private float startYaw = 0;
-    private float targetYaw = 0;
-    private float startPitch = 0;
-    private float targetPitch = 0;
+    public record StepTarget(float targetYaw, float targetPitch, float durationSeconds) {}
 
+    public static String normalizeTitle(String raw) {
+        if (raw == null) return "";
+        String stripped = FORMATTING_CODE_PATTERN.matcher(raw).replaceAll("");
+        return stripped.replaceAll("\\s+", " ").toLowerCase(Locale.ROOT).trim();
+    }
+
+    public static TitleActions parseTitleActions(String raw) {
+        String normalized = normalizeTitle(raw);
+        if (normalized.isEmpty()) {
+            return new TitleActions(false, false, false, false, false, false);
+        }
+        return new TitleActions(
+            normalized.contains("sneak"),
+            normalized.contains("jump"),
+            normalized.contains("look left"),
+            normalized.contains("look right"),
+            normalized.contains("look up"),
+            normalized.contains("look down")
+        );
+    }
+
+    public static StepTarget computeStepTarget(LookStep step, float originalYaw, float originalPitch) {
+        float clampedOriginPitch = clampPitch(originalPitch);
+        return switch (step) {
+            case LOOK_LEFT -> new StepTarget(originalYaw - 180f, clampedOriginPitch, 1.2f);
+            case CENTER_FROM_LEFT -> new StepTarget(originalYaw, clampedOriginPitch, 1.2f);
+            case LOOK_RIGHT -> new StepTarget(originalYaw + 180f, clampedOriginPitch, 1.2f);
+            case CENTER_FROM_RIGHT -> new StepTarget(originalYaw, clampedOriginPitch, 1.2f);
+            case LOOK_UP -> new StepTarget(originalYaw, -75f, 0.8f);
+            case LOOK_DOWN -> new StepTarget(originalYaw, 75f, 1.0f);
+            case RESET_PITCH -> new StepTarget(originalYaw, clampedOriginPitch, 0.6f);
+        };
+    }
+
+    public static float computeSmoothProgress(float elapsedSeconds, float durationSeconds) {
+        if (durationSeconds <= 0f) return 1.0f;
+        float rawProgress = Math.max(0.0f, Math.min(1.0f, elapsedSeconds / durationSeconds));
+        return 0.5f * (1.0f - (float) Math.cos(PI_FLOAT * rawProgress));
+    }
+
+    public static float clampPitch(float pitch) {
+        return Math.max(-90.0f, Math.min(90.0f, pitch));
+    }
+
+    public static float[] computeFrameAngles(
+        LookStep step,
+        float startYaw,
+        float targetYaw,
+        float startPitch,
+        float targetPitch,
+        float elapsedSeconds,
+        float durationSeconds,
+        boolean applyWobble
+    ) {
+        float rawProgress = durationSeconds > 0f
+            ? Math.max(0.0f, Math.min(1.0f, elapsedSeconds / durationSeconds))
+            : 1.0f;
+        float smoothProgress = computeSmoothProgress(elapsedSeconds, durationSeconds);
+
+        float currentYaw = startYaw + (targetYaw - startYaw) * smoothProgress;
+        float currentPitch = startPitch + (targetPitch - startPitch) * smoothProgress;
+
+        if (applyWobble && rawProgress > 0.05f && rawProgress < 0.95f) {
+            float wobble = (float) Math.sin(elapsedSeconds * 22.0) * 0.14f;
+            if (step.isHorizontal()) {
+                currentPitch += wobble;
+            } else {
+                currentYaw += wobble;
+            }
+        }
+
+        currentPitch = clampPitch(currentPitch);
+        return new float[]{currentYaw, currentPitch};
+    }
+
+    public static class StateMachine {
+        private double originalX;
+        private double originalY;
+        private double originalZ;
+        private float originalYaw;
+        private float originalPitch;
+        private boolean savedState = false;
+
+        private String activeTitleText = null;
+        private int titleActiveTicks = 0;
+        private TitleActions titleActions = new TitleActions(false, false, false, false, false, false);
+
+        private int bruteForceTotalTicks = 0;
+        private LookStep currentLookStep = LookStep.LOOK_LEFT;
+
+        private float stepTimeElapsed = 0f;
+        private float stepDurationSeconds = 1.2f;
+        private int sneakPulseTicks = 0;
+
+        private float startYaw = 0f;
+        private float targetYaw = 0f;
+        private float startPitch = 0f;
+        private float targetPitch = 0f;
+
+        private boolean shiftDown = false;
+        private boolean jumpDown = false;
+
+        public void reset() {
+            activeTitleText = null;
+            titleActiveTicks = 0;
+            titleActions = new TitleActions(false, false, false, false, false, false);
+            bruteForceTotalTicks = 0;
+            stepTimeElapsed = 0f;
+            sneakPulseTicks = 0;
+            currentLookStep = LookStep.LOOK_LEFT;
+            savedState = false;
+            shiftDown = false;
+            jumpDown = false;
+        }
+
+        public void saveStateIfNeeded(double x, double y, double z, float yaw, float pitch) {
+            if (savedState) return;
+            originalX = x;
+            originalY = y;
+            originalZ = z;
+            originalYaw = yaw;
+            originalPitch = clampPitch(pitch);
+            savedState = true;
+        }
+
+        public void onClearTitles() {
+            if (bruteForceTotalTicks <= 0) {
+                titleActiveTicks = 0;
+                activeTitleText = null;
+            }
+        }
+
+        public enum TitleProcessOutcome {
+            IGNORED_BLANK,
+            IGNORED_BRUTE_FORCE_ACTIVE,
+            IGNORED_NO_ACTION,
+            STARTED_BRUTE_FORCE,
+            STARTED_STANDARD_ACTION
+        }
+
+        public TitleProcessOutcome onTitle(
+            String rawText,
+            double currentX,
+            double currentY,
+            double currentZ,
+            float currentYaw,
+            float currentPitch,
+            boolean bruteForceSetting,
+            boolean onAnyTitleSetting,
+            int bruteForceDurationSeconds,
+            int titleHoldSeconds
+        ) {
+            String normalized = normalizeTitle(rawText);
+            if (normalized.isEmpty()) {
+                return TitleProcessOutcome.IGNORED_BLANK;
+            }
+
+            if (bruteForceTotalTicks > 0) {
+                return TitleProcessOutcome.IGNORED_BRUTE_FORCE_ACTIVE;
+            }
+
+            TitleActions parsed = parseTitleActions(normalized);
+            boolean triggerBruteForce = bruteForceSetting || onAnyTitleSetting;
+
+            if (!triggerBruteForce && !parsed.hasAnyAction()) {
+                return TitleProcessOutcome.IGNORED_NO_ACTION;
+            }
+
+            saveStateIfNeeded(currentX, currentY, currentZ, currentYaw, currentPitch);
+            activeTitleText = normalized;
+            titleActions = parsed;
+
+            if (triggerBruteForce) {
+                titleActiveTicks = 0;
+                bruteForceTotalTicks = Math.max(1, bruteForceDurationSeconds) * 20;
+                prepareLookStep(LookStep.LOOK_LEFT, currentYaw, currentPitch);
+                return TitleProcessOutcome.STARTED_BRUTE_FORCE;
+            }
+
+            titleActiveTicks = Math.max(1, titleHoldSeconds) * 20;
+            initStandardAction(currentYaw, currentPitch);
+            return TitleProcessOutcome.STARTED_STANDARD_ACTION;
+        }
+
+        public void prepareLookStep(LookStep step, float currentYaw, float currentPitch) {
+            currentLookStep = step;
+            stepTimeElapsed = 0f;
+            startYaw = currentYaw;
+            startPitch = clampPitch(currentPitch);
+
+            StepTarget target = computeStepTarget(step, originalYaw, originalPitch);
+            stepDurationSeconds = target.durationSeconds();
+            targetYaw = target.targetYaw();
+            targetPitch = target.targetPitch();
+        }
+
+        private void initStandardAction(float currentYaw, float currentPitch) {
+            shiftDown = titleActions.sneak();
+            jumpDown = titleActions.jump();
+
+            startYaw = currentYaw;
+            startPitch = clampPitch(currentPitch);
+            targetYaw = originalYaw;
+            targetPitch = originalPitch;
+
+            if (titleActions.lookLeft()) {
+                targetYaw = originalYaw - 180f;
+                stepTimeElapsed = 0f;
+                stepDurationSeconds = 0.8f;
+            } else if (titleActions.lookRight()) {
+                targetYaw = originalYaw + 180f;
+                stepTimeElapsed = 0f;
+                stepDurationSeconds = 0.8f;
+            }
+
+            if (titleActions.lookUp()) {
+                targetPitch = -75f;
+                stepTimeElapsed = 0f;
+                stepDurationSeconds = 0.8f;
+            } else if (titleActions.lookDown()) {
+                targetPitch = 75f;
+                stepTimeElapsed = 0f;
+                stepDurationSeconds = 0.8f;
+            }
+        }
+
+        public float[] onRenderFrame(float frameTimeSeconds, float currentYaw, float currentPitch, boolean applyWobble) {
+            if (bruteForceTotalTicks <= 0) {
+                return new float[]{currentYaw, clampPitch(currentPitch)};
+            }
+            if (frameTimeSeconds > 0f) {
+                stepTimeElapsed += frameTimeSeconds;
+            }
+
+            float[] angles = computeFrameAngles(
+                currentLookStep,
+                startYaw,
+                targetYaw,
+                startPitch,
+                targetPitch,
+                stepTimeElapsed,
+                stepDurationSeconds,
+                applyWobble
+            );
+
+            if (stepTimeElapsed >= stepDurationSeconds) {
+                prepareLookStep(currentLookStep.next(), angles[0], angles[1]);
+            }
+
+            return angles;
+        }
+
+        public record TickResult(
+            boolean triggerJumpAndPunch,
+            boolean updateStandardLook,
+            float newYaw,
+            float newPitch,
+            boolean restoreState,
+            boolean restoredFromBruteForce
+        ) {}
+
+        public TickResult onTick(int actionCadenceSeconds, float currentYaw, float currentPitch) {
+            if (titleActiveTicks > 0) {
+                titleActiveTicks--;
+            }
+
+            // 1. Brute Force Mode Logic (Tick Cadences)
+            if (bruteForceTotalTicks > 0) {
+                int cadenceTicks = Math.max(1, actionCadenceSeconds) * 20;
+                boolean triggerCadence = (bruteForceTotalTicks % cadenceTicks == 0);
+
+                bruteForceTotalTicks--;
+
+                if (triggerCadence) {
+                    sneakPulseTicks = 8;
+                    shiftDown = true;
+                } else if (sneakPulseTicks > 0) {
+                    sneakPulseTicks--;
+                    if (sneakPulseTicks == 0) {
+                        shiftDown = false;
+                    }
+                }
+
+                if (bruteForceTotalTicks == 0) {
+                    sneakPulseTicks = 0;
+                    shiftDown = false;
+                    jumpDown = false;
+                    titleActiveTicks = 0;
+                    activeTitleText = null;
+                    return new TickResult(triggerCadence, false, originalYaw, originalPitch, savedState, true);
+                }
+
+                return new TickResult(triggerCadence, false, currentYaw, currentPitch, false, false);
+            }
+
+            // 2. Standard Title Actions
+            if (titleActiveTicks > 0 && activeTitleText != null) {
+                shiftDown = titleActions.sneak();
+                jumpDown = titleActions.jump();
+
+                if (titleActions.hasLookAction()) {
+                    stepTimeElapsed += 0.05f;
+                    float smoothProgress = computeSmoothProgress(stepTimeElapsed, stepDurationSeconds);
+                    float nextYaw = startYaw + (targetYaw - startYaw) * smoothProgress;
+                    float nextPitch = clampPitch(startPitch + (targetPitch - startPitch) * smoothProgress);
+                    return new TickResult(false, true, nextYaw, nextPitch, false, false);
+                }
+                return new TickResult(false, false, currentYaw, currentPitch, false, false);
+            }
+
+            // 3. Title expired -> restore state
+            if (savedState && titleActiveTicks == 0) {
+                shiftDown = false;
+                jumpDown = false;
+                activeTitleText = null;
+                return new TickResult(false, false, originalYaw, originalPitch, true, false);
+            }
+
+            return new TickResult(false, false, currentYaw, currentPitch, false, false);
+        }
+
+        public void markStateRestored() {
+            savedState = false;
+            shiftDown = false;
+            jumpDown = false;
+        }
+
+        public double getOriginalX() { return originalX; }
+        public double getOriginalY() { return originalY; }
+        public double getOriginalZ() { return originalZ; }
+        public float getOriginalYaw() { return originalYaw; }
+        public float getOriginalPitch() { return originalPitch; }
+        public boolean isSavedState() { return savedState; }
+        public String getActiveTitleText() { return activeTitleText; }
+        public int getTitleActiveTicks() { return titleActiveTicks; }
+        public TitleActions getTitleActions() { return titleActions; }
+        public int getBruteForceTotalTicks() { return bruteForceTotalTicks; }
+        public LookStep getCurrentLookStep() { return currentLookStep; }
+        public float getStepTimeElapsed() { return stepTimeElapsed; }
+        public float getStepDurationSeconds() { return stepDurationSeconds; }
+        public int getSneakPulseTicks() { return sneakPulseTicks; }
+        public float getStartYaw() { return startYaw; }
+        public float getTargetYaw() { return targetYaw; }
+        public float getStartPitch() { return startPitch; }
+        public float getTargetPitch() { return targetPitch; }
+        public boolean isShiftDown() { return shiftDown; }
+        public boolean isJumpDown() { return jumpDown; }
+    }
+
+    private final StateMachine state = new StateMachine();
     private final Random random = new Random();
 
     public TitleAntiAFK() {
@@ -134,37 +494,19 @@ public class TitleAntiAFK extends Module {
         resetState();
     }
 
-    private void saveState() {
-        if (!Utils.canUpdate() || savedState) return;
-        originalPos = mc.player.position();
-        originalYaw = mc.player.getYRot();
-        originalPitch = mc.player.getXRot();
-        savedState = true;
-    }
-
     private void restoreStateIfSaved() {
-        if (!Utils.canUpdate() || !savedState) return;
-        mc.player.teleportTo(originalPos.x, originalPos.y, originalPos.z);
-        mc.player.setYRot(originalYaw);
-        mc.player.setXRot(originalPitch);
+        if (!Utils.canUpdate() || !state.isSavedState()) return;
+        mc.player.teleportTo(state.getOriginalX(), state.getOriginalY(), state.getOriginalZ());
+        mc.player.setYRot(state.getOriginalYaw());
+        mc.player.setXRot(state.getOriginalPitch());
         mc.options.keyShift.setDown(false);
         mc.options.keyJump.setDown(false);
-        savedState = false;
+        state.markStateRestored();
     }
 
     private void resetState() {
-        activeTitleText = null;
-        titleActiveTicks = 0;
-        titleHasSneak = false;
-        titleHasJump = false;
-        titleHasLookLeft = false;
-        titleHasLookRight = false;
-        bruteForceTotalTicks = 0;
-        stepTimeElapsed = 0f;
-        sneakPulseTicks = 0;
-        currentLookStep = LookStep.LOOK_LEFT;
-        savedState = false;
-        if (mc.options != null) {
+        state.reset();
+        if (mc != null && mc.options != null) {
             mc.options.keyShift.setDown(false);
             mc.options.keyJump.setDown(false);
         }
@@ -180,15 +522,12 @@ public class TitleAntiAFK extends Module {
         } else if (event.packet instanceof ClientboundSetSubtitleTextPacket p) {
             comp = p.text();
         } else if (event.packet instanceof ClientboundClearTitlesPacket) {
-            if (bruteForceTotalTicks <= 0) {
-                titleActiveTicks = 0;
-                activeTitleText = null;
-            }
+            state.onClearTitles();
             return;
         }
 
         if (comp != null) {
-            String text = comp.getString().toLowerCase(Locale.ROOT).trim();
+            String text = normalizeTitle(comp.getString());
             if (!text.isEmpty()) {
                 processTitleText(text);
             }
@@ -197,111 +536,37 @@ public class TitleAntiAFK extends Module {
 
     public void processTitleText(String text) {
         if (text == null || text.isBlank()) return;
-        String normalized = text.toLowerCase(Locale.ROOT).trim();
+        if (!Utils.canUpdate()) return;
 
-        if (bruteForceTotalTicks > 0) {
-            info("Brute Force active: Ignored secondary title \"" + normalized + "\"");
-            return;
-        }
+        Vec3 pos = mc.player.position();
+        StateMachine.TitleProcessOutcome outcome = state.onTitle(
+            text,
+            pos.x,
+            pos.y,
+            pos.z,
+            mc.player.getYRot(),
+            mc.player.getXRot(),
+            bruteForce.get(),
+            onAnyTitle.get(),
+            bruteForceDuration.get(),
+            titleHoldSeconds.get()
+        );
 
-        boolean hasSneak = normalized.contains("sneak");
-        boolean hasJump = normalized.contains("jump");
-        boolean hasLookLeft = normalized.contains("look left");
-        boolean hasLookRight = normalized.contains("look right");
-        boolean hasAction = hasSneak || hasJump || hasLookLeft || hasLookRight;
-        boolean triggerBruteForce = bruteForce.get() || onAnyTitle.get();
-
-        if (!triggerBruteForce && !hasAction) {
-            return;
-        }
-
-        saveState();
-        activeTitleText = normalized;
-        titleActiveTicks = titleHoldSeconds.get() * 20;
-
-        titleHasSneak = hasSneak;
-        titleHasJump = hasJump;
-        titleHasLookLeft = hasLookLeft;
-        titleHasLookRight = hasLookRight;
-
-        if (triggerBruteForce) {
-            bruteForceTotalTicks = bruteForceDuration.get() * 20;
-            startBruteForceSequence();
-            info("Brute force Anti-AFK triggered for title: \"" + normalized + "\"");
-            return;
-        }
-
-        info("Title detected: \"" + normalized + "\" (Executing while active for " + titleHoldSeconds.get() + "s)");
-        initActionForText(normalized);
-    }
-
-    private void startBruteForceSequence() {
-        currentLookStep = LookStep.LOOK_LEFT;
-        prepareLookStep(LookStep.LOOK_LEFT);
-    }
-
-    private void prepareLookStep(LookStep step) {
-        currentLookStep = step;
-        stepTimeElapsed = 0f;
-
-        startYaw = mc.player.getYRot();
-        startPitch = mc.player.getXRot();
-
-        switch (step) {
-            case LOOK_LEFT -> {
-                // Turn left 180° from original position
-                stepDurationSeconds = 1.2f;
-                targetYaw = originalYaw - 180f;
-                targetPitch = originalPitch;
+        String normalized = normalizeTitle(text);
+        switch (outcome) {
+            case IGNORED_BRUTE_FORCE_ACTIVE ->
+                info("Brute Force active: Ignored secondary title \"" + normalized + "\"");
+            case STARTED_BRUTE_FORCE ->
+                info("Brute force Anti-AFK triggered for title: \"" + normalized + "\"");
+            case STARTED_STANDARD_ACTION -> {
+                info("Title detected: \"" + normalized + "\" (Executing while active for " + titleHoldSeconds.get() + "s)");
+                mc.options.keyShift.setDown(state.isShiftDown());
+                mc.options.keyJump.setDown(state.isJumpDown());
+                if (state.getTitleActions().jump() && mc.player.onGround()) {
+                    mc.player.jumpFromGround();
+                }
             }
-            case CENTER_FROM_LEFT -> {
-                // Return to center from left (right 180°)
-                stepDurationSeconds = 1.2f;
-                targetYaw = originalYaw;
-                targetPitch = originalPitch;
-            }
-            case LOOK_RIGHT -> {
-                // Turn right 180° from original position
-                stepDurationSeconds = 1.2f;
-                targetYaw = originalYaw + 180f;
-                targetPitch = originalPitch;
-            }
-            case CENTER_FROM_RIGHT -> {
-                // Return to center from right (left 180°)
-                stepDurationSeconds = 1.2f;
-                targetYaw = originalYaw;
-                targetPitch = originalPitch;
-            }
-            case LOOK_UP -> {
-                // Pitch up to -75°
-                stepDurationSeconds = 0.8f;
-                targetYaw = originalYaw;
-                targetPitch = -75f;
-            }
-            case LOOK_DOWN -> {
-                // Pitch down to +75°
-                stepDurationSeconds = 1.0f;
-                targetYaw = originalYaw;
-                targetPitch = 75f;
-            }
-            case RESET_PITCH -> {
-                // Pitch back to original
-                stepDurationSeconds = 0.6f;
-                targetYaw = originalYaw;
-                targetPitch = originalPitch;
-            }
-        }
-    }
-
-    private void advanceLookStep() {
-        switch (currentLookStep) {
-            case LOOK_LEFT -> prepareLookStep(LookStep.CENTER_FROM_LEFT);
-            case CENTER_FROM_LEFT -> prepareLookStep(LookStep.LOOK_RIGHT);
-            case LOOK_RIGHT -> prepareLookStep(LookStep.CENTER_FROM_RIGHT);
-            case CENTER_FROM_RIGHT -> prepareLookStep(LookStep.LOOK_UP);
-            case LOOK_UP -> prepareLookStep(LookStep.LOOK_DOWN);
-            case LOOK_DOWN -> prepareLookStep(LookStep.RESET_PITCH);
-            case RESET_PITCH -> prepareLookStep(LookStep.LOOK_LEFT); // Loop
+            default -> {}
         }
     }
 
@@ -314,134 +579,66 @@ public class TitleAntiAFK extends Module {
         }
     }
 
-    private void initActionForText(String text) {
-        mc.options.keyShift.setDown(titleHasSneak);
-        mc.options.keyJump.setDown(titleHasJump);
-
-        if (titleHasLookLeft) {
-            startYaw = mc.player.getYRot();
-            targetYaw = originalYaw - 180f;
-            targetPitch = originalPitch;
-            stepTimeElapsed = 0f;
-            stepDurationSeconds = 0.8f;
-        } else if (titleHasLookRight) {
-            startYaw = mc.player.getYRot();
-            targetYaw = originalYaw + 180f;
-            targetPitch = originalPitch;
-            stepTimeElapsed = 0f;
-            stepDurationSeconds = 0.8f;
-        }
-
-        if (titleHasJump && mc.player.onGround()) {
-            mc.player.jumpFromGround();
-        }
-    }
-
     @EventHandler
     private void onRender3D(Render3DEvent event) {
-        if (bruteForceTotalTicks <= 0 || !Utils.canUpdate()) return;
+        if (state.getBruteForceTotalTicks() <= 0 || !Utils.canUpdate()) return;
 
-        stepTimeElapsed += (float) event.frameTime;
+        float[] angles = state.onRenderFrame(
+            (float) event.frameTime,
+            mc.player.getYRot(),
+            mc.player.getXRot(),
+            humanWobble.get()
+        );
 
-        float rawProgress = Math.min(1.0f, stepTimeElapsed / stepDurationSeconds);
-
-        // Cosine S-curve easing for cinematic acceleration & deceleration
-        float smoothProgress = 0.5f * (1.0f - (float) Math.cos(PI_FLOAT * rawProgress));
-
-        // Raw deltas — no wrapDegrees! Each step is designed to be <= 180° so direction is always correct
-        float deltaYaw = targetYaw - startYaw;
-        float deltaPitch = targetPitch - startPitch;
-
-        float currentYaw = startYaw + deltaYaw * smoothProgress;
-        float currentPitch = startPitch + deltaPitch * smoothProgress;
-
-        // 1-2 pixel organic human micro-wobble along the perpendicular axis
-        if (humanWobble.get() && rawProgress > 0.05f && rawProgress < 0.95f) {
-            float wobble = (float) Math.sin(stepTimeElapsed * 22.0) * 0.14f;
-            boolean isHorizontalStep = (currentLookStep == LookStep.LOOK_LEFT
-                || currentLookStep == LookStep.CENTER_FROM_LEFT
-                || currentLookStep == LookStep.LOOK_RIGHT
-                || currentLookStep == LookStep.CENTER_FROM_RIGHT);
-
-            if (isHorizontalStep) {
-                currentPitch += wobble; // Subtle vertical wobble during horizontal turn
-            } else {
-                currentYaw += wobble;   // Subtle horizontal wobble during vertical pitch
-            }
-        }
-
-        mc.player.setYRot(currentYaw);
-        mc.player.setXRot(currentPitch);
-        mc.player.yRotO = currentYaw;
-        mc.player.xRotO = currentPitch;
-
-        if (stepTimeElapsed >= stepDurationSeconds) {
-            advanceLookStep();
-        }
+        mc.player.setYRot(angles[0]);
+        mc.player.setXRot(angles[1]);
+        mc.player.yRotO = angles[0];
+        mc.player.xRotO = angles[1];
     }
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
         if (!Utils.canUpdate()) return;
 
-        if (titleActiveTicks > 0) {
-            titleActiveTicks--;
-        }
+        boolean wasBruteForce = state.getBruteForceTotalTicks() > 0;
+        StateMachine.TickResult result = state.onTick(
+            actionCadenceSeconds.get(),
+            mc.player.getYRot(),
+            mc.player.getXRot()
+        );
 
-        // 1. Brute Force Mode Logic (Tick Cadences)
-        if (bruteForceTotalTicks > 0) {
-            bruteForceTotalTicks--;
-
-            int cadenceTicks = actionCadenceSeconds.get() * 20;
-            if (bruteForceTotalTicks % cadenceTicks == 0) {
+        if (wasBruteForce) {
+            if (result.triggerJumpAndPunch()) {
                 if (mc.player.onGround()) {
                     mc.player.jumpFromGround();
                 }
                 performPunch();
-                sneakPulseTicks = 8;
-                mc.options.keyShift.setDown(true);
             }
+            mc.options.keyShift.setDown(state.isShiftDown());
 
-            if (sneakPulseTicks > 0) {
-                sneakPulseTicks--;
-                if (sneakPulseTicks == 0) {
-                    mc.options.keyShift.setDown(false);
-                }
-            }
-
-            if (bruteForceTotalTicks == 0) {
+            if (result.restoreState()) {
                 restoreStateIfSaved();
                 info("Brute force sequence finished. Restored exact position and pitch/yaw.");
             }
             return;
         }
 
-        // 2. Standard Title Actions
-        if (titleActiveTicks > 0 && activeTitleText != null) {
-            if (titleHasSneak) {
-                mc.options.keyShift.setDown(true);
+        if (state.getTitleActiveTicks() > 0 && state.getActiveTitleText() != null) {
+            mc.options.keyShift.setDown(state.isShiftDown());
+            if (state.getTitleActions().jump() && mc.player.onGround() && random.nextInt(5) == 0) {
+                mc.player.jumpFromGround();
             }
-            if (titleHasJump) {
-                if (mc.player.onGround() && random.nextInt(5) == 0) {
-                    mc.player.jumpFromGround();
-                }
-            }
-            if (titleHasLookLeft || titleHasLookRight) {
-                stepTimeElapsed += 0.05f;
-                float rawProgress = Math.min(1.0f, stepTimeElapsed / stepDurationSeconds);
-                float smoothProgress = 0.5f * (1.0f - (float) Math.cos(PI_FLOAT * rawProgress));
-                float deltaYaw = targetYaw - startYaw;
-                float currentYaw = startYaw + deltaYaw * smoothProgress;
-                mc.player.setYRot(currentYaw);
-                mc.player.yRotO = currentYaw;
+            if (result.updateStandardLook()) {
+                mc.player.setYRot(result.newYaw());
+                mc.player.setXRot(result.newPitch());
+                mc.player.yRotO = result.newYaw();
+                mc.player.xRotO = result.newPitch();
             }
             return;
         }
 
-        // Title expired -> restore state
-        if (savedState && titleActiveTicks == 0) {
+        if (result.restoreState()) {
             restoreStateIfSaved();
-            activeTitleText = null;
             info("Title display ended. Restored position & rotation.");
         }
     }
